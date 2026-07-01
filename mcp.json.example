@@ -1,0 +1,29 @@
+{
+  "servers": {
+    "filesystem": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "${HOME}"],
+      "enabled": false
+    },
+    "github": {
+      "transport": "stdio",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_PERSONAL_ACCESS_TOKEN": "${GITHUB_TOKEN}"
+      },
+      "enabled": false,
+      "allowedTools": ["list_repositories", "get_file_contents", "search_code", "create_issue"],
+      "blockedTools": ["push_files", "create_repository", "delete_repository"]
+    },
+    "remote-example": {
+      "transport": "sse",
+      "url": "http://127.0.0.1:8080/sse",
+      "headers": {
+        "Authorization": "Bearer ${MY_MCP_TOKEN}"
+      },
+      "enabled": false
+    }
+  }
+}

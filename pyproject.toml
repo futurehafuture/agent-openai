@@ -1,0 +1,64 @@
+[project]
+name = "lumen-desk"
+version = "0.1.0"
+description = "Lumen — a beautiful desktop work agent built on the OpenAI Agents SDK"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Lumen" }]
+dependencies = [
+    # Agent runtime
+    "openai-agents>=0.17,<1",
+    "openai>=2.36.0,<3",
+    "pydantic>=2.11,<3",
+    # Desktop shell + web server
+    "pywebview>=5.3",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-dotenv>=1.0",
+    # macOS native webview backend (no-op markers elsewhere)
+    "pyobjc-framework-WebKit>=10.0; sys_platform == 'darwin'",
+    # Task capabilities
+    "pandas>=2.2",
+    "matplotlib>=3.9",
+    "openpyxl>=3.1",
+    "python-pptx>=1.0",
+    "pypdf>=5.0",
+    "python-docx>=1.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "httpx>=0.27",
+]
+
+[project.scripts]
+lumen = "lumen.app:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["lumen"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+ignore = ["B008"]  # function-call-in-default is idiomatic for Agents SDK tools
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = false
