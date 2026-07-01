@@ -19,6 +19,9 @@ venv/
 *.db
 .lumen/
 
+# Claude Code
+.claude/
+
 # OS
 .DS_Store
 
