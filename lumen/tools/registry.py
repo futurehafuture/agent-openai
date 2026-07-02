@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from agents import FunctionTool, function_tool
 
 from ..logging_setup import get_logger
-from ..workspace import WorkspaceError
+from ..workspace import ApprovalRequired, WorkspaceError
 
 logger = get_logger(__name__)
 
@@ -54,6 +54,8 @@ def _guard(func: Callable[..., str]) -> Callable[..., str]:
     def wrapper(*args: object, **kwargs: object) -> str:
         try:
             return func(*args, **kwargs)
+        except ApprovalRequired as exc:
+            return f"⚠️ Approval required: {exc}"
         except WorkspaceError as exc:
             return f"⚠️ Not allowed: {exc}"
         except FileNotFoundError as exc:

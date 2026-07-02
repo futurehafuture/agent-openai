@@ -2,15 +2,13 @@
 
 Three zones, enforced centrally so individual tools can't get path handling wrong:
 
-* **Home zone** — the user's home tree *minus* a denylist of sensitive directories
-  (``~/Library``, ``~/.ssh``, credentials, etc.). Core fs tools (read/write/edit)
-  may read and write anywhere inside this zone.
-* **Output zone** (``output_dir``, default ``~/Lumen``) — preferred location for
-  generated artifacts (decks, charts, exports). Skill tools still write here by
-  default, but the agent may write elsewhere in home when the user asks.
+* **Project zone** (``output_dir``, default ``~/Lumen``) — the selected project
+  folder. Core filesystem tools, generated artifacts, and shell commands work
+  inside this folder by default.
 * **System roots** — always off-limits (``/System``, ``/etc``, …).
 
-This module only answers "is this path allowed?" — it does not implement deletes.
+Paths outside the selected project folder are rejected with an approval-required
+error so the UI can keep the user in the loop before anything escapes the project.
 """
 
 from __future__ import annotations
@@ -41,6 +39,10 @@ class WorkspaceError(ValueError):
     """Raised when a path is outside the permitted sandbox."""
 
 
+class ApprovalRequired(WorkspaceError):
+    """Raised when an operation leaves the selected project folder."""
+
+
 class WorkspaceManager:
     """Resolves and validates paths against the Lumen sandbox."""
 
@@ -49,11 +51,17 @@ class WorkspaceManager:
         self._home = Path.home().resolve()
 
     def configure(self, output_dir: Path | str) -> None:
-        """Set (and create) the output directory. Idempotent."""
-        path = Path(output_dir).expanduser().resolve()
+        """Set (and create) the selected project directory. Idempotent."""
+        path = self.validate_project_root(output_dir)
         path.mkdir(parents=True, exist_ok=True)
         self._output_dir = path
-        logger.info("Workspace output directory: %s", path)
+        logger.info("Workspace project directory: %s", path)
+
+    def validate_project_root(self, path: Path | str) -> Path:
+        """Resolve and validate a candidate project root."""
+        resolved = Path(path).expanduser().resolve()
+        self._assert_safe_project_root(resolved)
+        return resolved
 
     @property
     def output_dir(self) -> Path:
@@ -66,7 +74,7 @@ class WorkspaceManager:
     def home(self) -> Path:
         return self._home
 
-    # -- output zone (writes) ------------------------------------------------
+    # -- project zone (writes) -----------------------------------------------
 
     def resolve_output(self, name: str) -> Path:
         """Resolve a safe path *inside* the output dir for a generated file.
@@ -76,8 +84,8 @@ class WorkspaceManager:
         """
         candidate = (self.output_dir / name).resolve()
         if not self._is_within(candidate, self.output_dir):
-            raise WorkspaceError(
-                f"Refusing to write outside the workspace output directory: {name!r}"
+            raise ApprovalRequired(
+                f"Writing outside the selected project folder requires user approval: {name!r}"
             )
         candidate.parent.mkdir(parents=True, exist_ok=True)
         return candidate
@@ -113,8 +121,8 @@ class WorkspaceManager:
         return candidate
 
     def resolve_write(self, path: str, *, create_parents: bool = True) -> Path:
-        """Resolve a path for writing anywhere inside the home sandbox."""
-        candidate = self._expand(path, relative_to_output=False)
+        """Resolve a path for writing inside the selected project folder."""
+        candidate = self._expand(path)
         self._assert_allowed(candidate)
         if create_parents:
             candidate.parent.mkdir(parents=True, exist_ok=True)
@@ -133,11 +141,21 @@ class WorkspaceManager:
         text = path.strip()
         p = Path(text).expanduser()
         if not p.is_absolute():
-            base = self.output_dir if relative_to_output else self._home
-            p = base / p
+            p = self.output_dir / p
         return p.resolve()
 
     def _assert_allowed(self, path: Path) -> None:
+        self._assert_safe_home_path(path)
+        if not self._is_within(path, self.output_dir):
+            raise ApprovalRequired(
+                "Access outside the selected project folder requires user approval: "
+                f"{self.display(path)}"
+            )
+
+    def _assert_safe_project_root(self, path: Path) -> None:
+        self._assert_safe_home_path(path)
+
+    def _assert_safe_home_path(self, path: Path) -> None:
         s = str(path)
         for root in _DENIED_ROOTS:
             if s == root or s.startswith(root + "/"):
@@ -167,4 +185,4 @@ class WorkspaceManager:
 # Process-wide singleton, configured at startup from AppConfig.
 workspace = WorkspaceManager()
 
-__all__ = ["workspace", "WorkspaceManager", "WorkspaceError"]
+__all__ = ["workspace", "WorkspaceManager", "WorkspaceError", "ApprovalRequired"]

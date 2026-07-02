@@ -115,6 +115,57 @@ class SessionManager:
         self._save_index()
         logger.info("Deleted session %s", session_id)
 
+    async def repair_if_needed(self, session_id: str) -> bool:
+        """Detect and fix orphaned tool-call sequences in session history.
+
+        DeepSeek (and other strict providers) reject requests when the conversation
+        history contains assistant messages with ``tool_calls`` that aren't followed
+        by corresponding tool-response messages.  This can happen when a previous
+        run was interrupted mid-turn (crash, disconnect, cancellation).
+
+        Returns:
+            ``True`` if a repair was performed (the session was cleared).
+        """
+        try:
+            session = self.get_session(session_id)
+            items = await session.get_items()
+        except Exception as exc:
+            logger.debug("Could not read session %s for repair check: %s", session_id, exc)
+            return False
+
+        # Walk items and track orphaned tool-call IDs.
+        orphaned: list[str] = []
+        pending: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type", "")
+            if itype == "function_call":
+                call_id = item.get("call_id") or item.get("id", "")
+                if call_id:
+                    pending.add(call_id)
+            elif itype == "function_call_output":
+                call_id = item.get("call_id", "")
+                if call_id in pending:
+                    pending.discard(call_id)
+        orphaned = list(pending)
+
+        if not orphaned:
+            return False
+
+        logger.warning(
+            "Session %s has %d orphaned tool call(s) (%s); clearing to avoid API errors.",
+            session_id,
+            len(orphaned),
+            ", ".join(orphaned[:3]),
+        )
+        try:
+            await session.clear_session()
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to repair session %s: %s", session_id, exc)
+            return False
+        return True
+
 
 def _derive_title(message: str, max_len: int = 48) -> str:
     text = " ".join(message.strip().split())

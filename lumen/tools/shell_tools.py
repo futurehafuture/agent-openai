@@ -1,4 +1,4 @@
-"""Shell execution tool — persistent-style bash within the home sandbox.
+"""Shell execution tool — persistent-style bash within the selected project folder.
 
 Inspired by Claude Code's Bash tool: use for git, package managers, builds, and
 anything without a dedicated tool. Prefer ``read_file`` / ``grep_files`` /
@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import subprocess
 from pathlib import Path
+from urllib.parse import urlparse
 
 from ..logging_setup import get_logger
 from ..workspace import workspace
@@ -24,10 +26,14 @@ _MAX_OUTPUT = 32_000
 # Commands that must never run regardless of path.
 _BLOCKED_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\bsudo\b"), "sudo is not allowed"),
-    (re.compile(r"\brm\s+-rf\s+/(?:\s|$)"), "recursive delete of filesystem root"),
-    (re.compile(r"\b(mkfs|diskutil\s+erase|dd\s+if=)\b"), "disk formatting/wiping"),
+    # Block rm -rf / -r on root, home, or any absolute path.
+    (re.compile(r"\brm\s+-r[f]?\s+(?:~|/|/[A-Za-z])"), "recursive force-delete of important paths"),
+    (re.compile(r"\brm\s+-rf?\s+\.(?:\s|$|/)"), "recursive delete of current directory"),
+    (re.compile(r"\b(mkfs|diskutil\s+erase\w*|dd\s+if=)"), "disk formatting/wiping"),
     (re.compile(r"\bchmod\s+[0-7]*777\b"), "world-writable permissions"),
     (re.compile(r"\b(curl|wget)\s+.*\|\s*(ba)?sh\b"), "piping remote scripts to shell"),
+    (re.compile(r":\(\s*\)\s*\{"), "fork bomb"),
+    (re.compile(r">\s*/dev/(null|zero|sda|disk)"), "device truncation/overwrite"),
 ]
 
 # Read-only commands that skip extra path checks when used alone.
@@ -62,6 +68,43 @@ def _validate_command(command: str) -> None:
     for pattern, reason in _BLOCKED_PATTERNS:
         if pattern.search(lowered):
             raise ValueError(f"Blocked command ({reason}).")
+    _validate_command_paths(command)
+
+
+def _validate_command_paths(command: str) -> None:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = command.split()
+
+    for token in tokens:
+        for candidate in _path_candidates(token):
+            workspace.resolve_read(candidate)
+
+
+def _path_candidates(token: str) -> list[str]:
+    if not token or token.startswith("-"):
+        return []
+    if _looks_like_url(token):
+        return []
+
+    text = token
+    if "=" in text and not text.startswith(("=", "==")):
+        text = text.rsplit("=", 1)[-1]
+    text = text.strip("\"'")
+    if not text or _looks_like_url(text):
+        return []
+
+    if text.startswith(("/", "~", "../", "..")):
+        return [text]
+    if "/.." in text:
+        return [text]
+    return []
+
+
+def _looks_like_url(text: str) -> bool:
+    parsed = urlparse(text)
+    return parsed.scheme in {"http", "https", "git", "ssh"} and bool(parsed.netloc)
 
 
 def _pick_cwd(cwd: str | None) -> Path:
@@ -76,7 +119,7 @@ def _pick_cwd(cwd: str | None) -> Path:
 def run_command(command: str, cwd: str | None = None, timeout_seconds: int = _DEFAULT_TIMEOUT) -> str:
     """Run a shell command in the user's environment.
 
-    The working directory defaults to the Lumen workspace folder. Commands run
+    The working directory defaults to the selected project folder. Commands run
     with the app's environment (including ``PATH``). Output is truncated at
     ~32 KB.
 
@@ -85,7 +128,7 @@ def run_command(command: str, cwd: str | None = None, timeout_seconds: int = _DE
 
     Args:
         command: Shell command to execute (single string, may use pipes).
-        cwd: Working directory (default: workspace folder ``~/Lumen``).
+        cwd: Working directory (default: selected project folder).
         timeout_seconds: Max seconds before the command is killed (default 120).
     """
     command = command.strip()
@@ -97,7 +140,10 @@ def run_command(command: str, cwd: str | None = None, timeout_seconds: int = _DE
     timeout = max(1, min(int(timeout_seconds), 600))
     env = os.environ.copy()
 
-    logger.info("Shell: %s (cwd=%s)", command[:120], workspace.display(workdir))
+    if re.search(r"\brm\b", command):
+        logger.warning("Shell rm command: %s (cwd=%s)", command[:120], workspace.display(workdir))
+    else:
+        logger.info("Shell: %s (cwd=%s)", command[:120], workspace.display(workdir))
     try:
         proc = subprocess.run(
             command,

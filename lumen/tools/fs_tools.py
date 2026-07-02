@@ -1,7 +1,7 @@
 """Core filesystem tools — Claude Code-style Read / Write / Edit / Glob / Grep.
 
 Prefer these dedicated tools over ``run_command`` for file operations. All paths
-are sandboxed to the user's home directory (sensitive folders blocked).
+are sandboxed to the selected project folder.
 """
 
 from __future__ import annotations
@@ -67,7 +67,7 @@ def read_file(path: str, offset: int = 1, limit: int | None = None) -> str:
 
 
 def write_file(path: str, content: str) -> str:
-    """Create or overwrite a file inside the home sandbox.
+    """Create or overwrite a file inside the selected project folder.
 
     Prefer ``edit_file`` for small changes to an existing file.
 
@@ -117,7 +117,7 @@ def edit_file(path: str, old_string: str, new_string: str, replace_all: bool = F
     return f"Edited **{workspace.display(target)}** — {replaced} replacement(s)."
 
 
-def glob_files(pattern: str, path: str = "~") -> str:
+def glob_files(pattern: str, path: str = ".") -> str:
     """Find files by glob pattern (e.g. ``**/*.py``, ``*.csv``).
 
     Use this instead of shell ``find`` or ``ls``. Patterns follow Python
@@ -125,7 +125,7 @@ def glob_files(pattern: str, path: str = "~") -> str:
 
     Args:
         pattern: Glob pattern such as ``**/*.md`` or ``src/*.ts``.
-        path: Directory to search (default home).
+        path: Directory to search (default selected project folder).
     """
     root = workspace.resolve_read(path)
     if not root.is_dir():
@@ -144,7 +144,7 @@ def glob_files(pattern: str, path: str = "~") -> str:
     )
 
 
-def grep_files(pattern: str, path: str = "~", glob_pattern: str = "*") -> str:
+def grep_files(pattern: str, path: str = ".", glob_pattern: str = "*") -> str:
     """Search file contents with a regex (like ``rg``).
 
     Use this instead of shell ``grep``. Binary files are skipped.

@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -218,7 +218,10 @@ class SettingsStore:
         for key, value in values.items():
             if key in _PERSISTED_DEFAULTS and value is not None:
                 if key == "providers":
-                    self._data[key] = self._validate_providers(value)
+                    self._data[key] = self._validate_providers(
+                        value,
+                        existing=self._data.get("providers", []),
+                    )
                 elif key == "active_provider_id":
                     pid = str(value).strip()
                     known = {p.get("id") for p in self._data.get("providers", [])}
@@ -273,10 +276,18 @@ class SettingsStore:
         return self.public_view()
 
     @staticmethod
-    def _validate_providers(providers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def _validate_providers(
+        providers: list[dict[str, Any]],
+        existing: list[dict[str, Any]] | None = None,
+    ) -> list[dict[str, Any]]:
         """Validate and normalise a provider list from the UI."""
         validated: list[dict[str, Any]] = []
         seen_ids: set[str] = set()
+        existing_by_id = {
+            str(p.get("id", "")): p
+            for p in (existing or [])
+            if isinstance(p, dict) and p.get("id")
+        }
         for entry in providers:
             if not isinstance(entry, dict):
                 continue
@@ -300,11 +311,14 @@ class SettingsStore:
                 default_model = models[0]
             elif default_model and default_model not in models:
                 models.append(default_model)
+            api_key = str(entry.get("api_key", "")).strip()
+            if not api_key and entry.get("api_key_set"):
+                api_key = str(existing_by_id.get(pid, {}).get("api_key", "")).strip()
             validated.append(
                 {
                     "id": pid,
                     "name": name,
-                    "api_key": str(entry.get("api_key", "")).strip(),
+                    "api_key": api_key,
                     "base_url": str(entry.get("base_url", "")).strip(),
                     "models": models,
                     "default_model": default_model,

@@ -28,10 +28,19 @@ from agents.exceptions import (
     InputGuardrailTripwireTriggered,
     MaxTurnsExceeded,
 )
-from openai.types.responses import ResponseTextDeltaEvent
+from openai.types.responses import (
+    ResponseFunctionCallArgumentsDeltaEvent,
+    ResponseFunctionCallArgumentsDoneEvent,
+    ResponseOutputItemAddedEvent,
+    ResponseReasoningSummaryTextDeltaEvent,
+    ResponseReasoningTextDeltaEvent,
+    ResponseTextDeltaEvent,
+)
 
 from ..config import AppConfig
 from ..logging_setup import get_logger
+from .sdk_traces import flush_sdk_traces
+from .traces import ModelTrace
 
 logger = get_logger(__name__)
 
@@ -43,11 +52,19 @@ async def stream_agent_run(
     user_input: str,
     session: Session,
     config: AppConfig,
+    session_id: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Yield normalized streaming events for one user turn."""
+    trace = ModelTrace.start(config=config, user_input=user_input, session_id=session_id, agent=agent)
     run_config = RunConfig(
         workflow_name="Lumen",
-        tracing_disabled=not config.enable_tracing,
+        tracing_disabled=False,
+        group_id=session_id,
+        trace_metadata={
+            "session_id": session_id,
+            "request_created_at": trace.created_at,
+            "workspace": str(config.workspace_dir),
+        },
     )
     result = Runner.run_streamed(
         agent,
@@ -57,42 +74,118 @@ async def stream_agent_run(
         run_config=run_config,
     )
     call_names: dict[str, str] = {}
+    streamed_reasoning_item_ids: set[str] = set()
+    streamed_tool_call_ids: set[str] = set()
+    argument_buffers: dict[str, str] = {}
 
     try:
         async for event in result.stream_events():
+            trace.record_raw_event(event)
             if event.type == "raw_response_event":
                 data = event.data
                 if isinstance(data, ResponseTextDeltaEvent) and data.delta:
-                    yield {"type": "token", "delta": data.delta}
+                    normalized = {"type": "token", "delta": data.delta}
+                    trace.record_normalized_event(normalized)
+                    yield normalized
+                elif isinstance(data, ResponseOutputItemAddedEvent):
+                    async for normalized in _normalize_raw_output_item_added(
+                        data,
+                        call_names,
+                        streamed_tool_call_ids,
+                    ):
+                        trace.record_normalized_event(normalized)
+                        yield normalized
+                elif isinstance(data, ResponseFunctionCallArgumentsDeltaEvent) and data.delta:
+                    item_id = data.item_id
+                    argument_buffers[item_id] = argument_buffers.get(item_id, "") + data.delta
+                    normalized = {
+                        "type": "tool_call_update",
+                        "id": item_id,
+                        "arguments": argument_buffers[item_id],
+                    }
+                    trace.record_normalized_event(normalized)
+                    yield normalized
+                elif isinstance(data, ResponseFunctionCallArgumentsDoneEvent):
+                    argument_buffers[data.item_id] = data.arguments
+                    normalized = {
+                        "type": "tool_call_update",
+                        "id": data.item_id,
+                        "name": data.name,
+                        "arguments": data.arguments,
+                    }
+                    trace.record_normalized_event(normalized)
+                    yield normalized
+                elif isinstance(data, ResponseReasoningSummaryTextDeltaEvent) and data.delta:
+                    streamed_reasoning_item_ids.add(data.item_id)
+                    normalized = {"type": "reasoning", "delta": data.delta}
+                    trace.record_normalized_event(normalized)
+                    yield normalized
+                elif isinstance(data, ResponseReasoningTextDeltaEvent) and data.delta:
+                    streamed_reasoning_item_ids.add(data.item_id)
+                    normalized = {"type": "reasoning", "delta": data.delta}
+                    trace.record_normalized_event(normalized)
+                    yield normalized
 
             elif event.type == "agent_updated_stream_event":
-                yield {"type": "agent", "name": event.new_agent.name}
+                normalized = {"type": "agent", "name": event.new_agent.name}
+                trace.record_normalized_event(normalized)
+                yield normalized
 
             elif event.type == "run_item_stream_event":
-                async for normalized in _normalize_item(event.item, call_names):
+                async for normalized in _normalize_item(
+                    event.item,
+                    call_names,
+                    streamed_reasoning_item_ids,
+                    streamed_tool_call_ids,
+                ):
+                    trace.record_normalized_event(normalized)
                     yield normalized
 
     except InputGuardrailTripwireTriggered as exc:
-        yield {
+        error = {
             "type": "error",
             "kind": "guardrail",
             "message": f"I can't help with that — it looks like {_guardrail_reason(exc)}.",
         }
+        if trace.trace_path:
+            error["trace_path"] = trace.trace_path
+        trace.record_normalized_event(error)
+        trace.finish("error", error=error)
+        flush_sdk_traces()
+        yield error
         return
     except MaxTurnsExceeded:
-        yield {
+        error = {
             "type": "error",
             "kind": "max_turns",
             "message": "This task reached the step limit. Try splitting it into smaller asks.",
         }
+        if trace.trace_path:
+            error["trace_path"] = trace.trace_path
+        trace.record_normalized_event(error)
+        trace.finish("error", error=error)
+        flush_sdk_traces()
+        yield error
         return
     except AgentsException as exc:
         logger.exception("Agent run failed")
-        yield {"type": "error", "kind": "agent", "message": f"The run failed: {exc}"}
+        error = {"type": "error", "kind": "agent", "message": f"The run failed: {exc}"}
+        if trace.trace_path:
+            error["trace_path"] = trace.trace_path
+        trace.record_normalized_event(error)
+        trace.finish("error", error=error)
+        flush_sdk_traces()
+        yield error
         return
     except Exception as exc:  # noqa: BLE001 - never let the stream crash the server
         logger.exception("Unexpected error during run")
-        yield {"type": "error", "kind": "unexpected", "message": f"Unexpected error: {exc}"}
+        error = {"type": "error", "kind": "unexpected", "message": f"Unexpected error: {exc}"}
+        if trace.trace_path:
+            error["trace_path"] = trace.trace_path
+        trace.record_normalized_event(error)
+        trace.finish("error", error=error)
+        flush_sdk_traces()
+        yield error
         return
     finally:
         # If the consumer abandoned us (disconnect) before completion, stop the run.
@@ -101,25 +194,75 @@ async def stream_agent_run(
                 result.cancel()
             except Exception:  # noqa: BLE001
                 pass
+            trace.finish("cancelled")
+            flush_sdk_traces()
 
-    yield {"type": "done", "usage": _usage(result)}
+    usage = _usage(result)
+    done = {"type": "done", "usage": usage}
+    if trace.trace_path:
+        done["trace_path"] = trace.trace_path
+    trace.record_normalized_event(done)
+    trace.finish("completed", usage=usage)
+    flush_sdk_traces()
+    yield done
 
 
-async def _normalize_item(item: Any, call_names: dict[str, str]) -> AsyncIterator[dict[str, Any]]:
+async def _normalize_item(
+    item: Any,
+    call_names: dict[str, str],
+    streamed_reasoning_item_ids: set[str],
+    streamed_tool_call_ids: set[str],
+) -> AsyncIterator[dict[str, Any]]:
     itype = getattr(item, "type", "")
     if itype == "tool_call_item":
         name, call_id, args = _tool_call_info(item)
         if call_id:
             call_names[call_id] = name
-        yield {"type": "tool_call", "name": name, "arguments": args}
+        if _get(item.raw_item, "id") in streamed_tool_call_ids:
+            return
+        yield {
+            "type": "tool_call",
+            "id": _get(item.raw_item, "id"),
+            "name": name,
+            "call_id": call_id,
+            "arguments": args,
+        }
     elif itype == "tool_call_output_item":
         call_id = _get(item.raw_item, "call_id")
         name = call_names.get(call_id or "", "tool")
-        yield {"type": "tool_output", "name": name, "output": _preview(_output_text(item))}
+        yield {"type": "tool_output", "call_id": call_id, "name": name, "output": _preview(_output_text(item))}
     elif itype == "reasoning_item":
+        if _get(item.raw_item, "id") in streamed_reasoning_item_ids:
+            return
         text = _reasoning_text(item)
         if text:
             yield {"type": "reasoning", "delta": text}
+
+
+async def _normalize_raw_output_item_added(
+    event: ResponseOutputItemAddedEvent,
+    call_names: dict[str, str],
+    streamed_tool_call_ids: set[str],
+) -> AsyncIterator[dict[str, Any]]:
+    item = event.item
+    if _get(item, "type") != "function_call":
+        return
+
+    name = _get(item, "name") or "tool"
+    call_id = _get(item, "call_id")
+    item_id = _get(item, "id")
+    if call_id:
+        call_names[call_id] = name
+    if item_id:
+        streamed_tool_call_ids.add(item_id)
+
+    yield {
+        "type": "tool_call",
+        "id": item_id,
+        "call_id": call_id,
+        "name": name,
+        "arguments": _get(item, "arguments") or "",
+    }
 
 
 def _tool_call_info(item: Any) -> tuple[str, str | None, Any]:

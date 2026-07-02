@@ -23,8 +23,8 @@ action runs through a sandboxed, safety-first tool layer.
   - **MCP** — connect stdio/SSE/HTTP MCP servers from `~/.lumen/mcp.json`.
 - **Production-grade architecture.** Immutable config, tool **registry**, input **guardrail**,
   persistent **sessions** (SQLite), structured logging, cancellation, and a filesystem **sandbox**.
-- **Safe by default.** Sensitive home folders blocked; shell blocks sudo/disk wipe; MCP supports
-  per-server tool allow/block lists.
+- **Safe by default.** Work is scoped to the selected project folder; shell blocks sudo/disk wipe;
+  MCP supports per-server tool allow/block lists.
 
 ## Architecture
 
@@ -84,7 +84,7 @@ stored in `~/.lumen/settings.json` (the API key file is written `0600`).
 |---|---|---|
 | API key | `OPENAI_API_KEY` | — (required) |
 | Model | `LUMEN_MODEL` | `gpt-4.1` |
-| Workspace (outputs) | `LUMEN_WORKSPACE` | `~/Lumen` |
+| Project workspace | `LUMEN_WORKSPACE` | `~/Lumen` |
 | Max steps / task | `LUMEN_MAX_TURNS` | `24` |
 | Send traces to OpenAI | `LUMEN_ENABLE_TRACING` | off |
 
@@ -108,8 +108,8 @@ Supports **stdio**, **SSE**, and **streamable-http** transports. Use `allowedToo
 
 ## Safety model
 
-- File tools read/write anywhere under home except blocked sensitive folders
-  (`~/Library`, `~/.ssh`, credentials, …); system paths are off-limits.
+- File tools and shell commands work inside the selected project folder. Paths outside
+  that folder require user review; system and sensitive paths remain off-limits.
 - Shell blocks sudo, disk wipe, and piping remote scripts to bash.
 - MCP servers are opt-in via `~/.lumen/mcp.json`; failed servers are skipped gracefully.
 - An input guardrail blocks clearly dangerous requests before the model runs.

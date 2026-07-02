@@ -12,23 +12,49 @@ import {
 } from "./ui.js";
 
 const $ = (id) => document.getElementById(id);
-const state = { sessionId: null, streaming: false, abort: null, settings: {}, tools: [] };
+const state = {
+  sessionId: null,
+  streaming: false,
+  abort: null,
+  settings: {},
+  tools: [],
+  workspaceOpen: false,
+  workspaceRoot: "",
+  workspaceFiles: [],
+  selectedFile: null,
+  collapsedWorkspaceDirs: new Set(),
+};
 
 const messagesEl = $("messages");
 const transcriptEl = $("transcript");
 const emptyEl = $("empty-state");
 const inputEl = $("input");
+const bootStartedAt = performance.now();
+const minBootMs = 2400;
 
 // ----------------------------------------------------------------- bootstrap
 async function init() {
   applyTheme(localStorage.getItem("lumen-theme") || "light");
   wireEvents();
   try {
+    setBootStatus("Checking local server...");
     const [health, tools, settings, sessions] = await Promise.all([
-      api.health(),
-      api.getTools(),
-      api.getSettings(),
-      api.listSessions(),
+      api.health().then((value) => {
+        setBootStatus("Model runtime ready.");
+        return value;
+      }),
+      api.getTools().then((value) => {
+        setBootStatus("Tool palette loaded.");
+        return value;
+      }),
+      api.getSettings().then((value) => {
+        setBootStatus("Workspace settings synced.");
+        return value;
+      }),
+      api.listSessions().then((value) => {
+        setBootStatus("Conversation history prepared.");
+        return value;
+      }),
     ]);
     state.tools = tools;
     state.settings = settings;
@@ -42,7 +68,9 @@ async function init() {
       toast("Add at least one LLM provider in Settings to begin.");
       openSettings();
     }
+    await finishBoot("Ready.");
   } catch (err) {
+    await finishBoot("Server connection delayed.");
     toast("Could not reach the Lumen server.");
     console.error(err);
   }
@@ -77,7 +105,10 @@ async function runTurn(message) {
     state.streaming = false;
     state.abort = null;
     updateComposer();
-    if (!failed) refreshSessions();
+    if (!failed) {
+      refreshSessions();
+      if (state.workspaceOpen) refreshWorkspaceFiles();
+    }
     scrollDown();
   }
 }
@@ -208,11 +239,156 @@ async function saveSettings() {
     const health = await api.health();
     $("model-chip").textContent = health.model;
     populateModelSelector(state.settings.providers, state.settings.active_provider_id, health.model);
+    if (state.workspaceOpen) refreshWorkspaceFiles();
     toast("Settings saved.");
     closeSettings();
   } catch (err) {
     toast("Could not save settings.");
   }
+}
+
+async function chooseWorkspace() {
+  try {
+    const result = await api.chooseWorkspace();
+    if (result.path) {
+      $("set-workspace").value = result.path;
+    }
+  } catch {
+    toast("Could not choose a project folder.");
+  }
+}
+
+// ----------------------------------------------------------------- workspace inspector
+function toggleWorkspacePanel() {
+  state.workspaceOpen = !state.workspaceOpen;
+  document.getElementById("app").classList.toggle("workspace-open", state.workspaceOpen);
+  $("workspace-toggle").setAttribute("aria-expanded", state.workspaceOpen ? "true" : "false");
+  if (state.workspaceOpen) refreshWorkspaceFiles();
+}
+
+async function refreshWorkspaceFiles() {
+  const list = $("workspace-file-list");
+  list.replaceChildren(el("div", { class: "workspace-empty" }, "Loading files…"));
+  try {
+    const data = await api.listWorkspaceFiles();
+    if (state.workspaceRoot && state.workspaceRoot !== data.root) {
+      state.collapsedWorkspaceDirs.clear();
+      state.selectedFile = null;
+    }
+    state.workspaceRoot = data.root || "";
+    state.workspaceFiles = data.files || [];
+    $("workspace-root").textContent = data.root || "";
+    $("workspace-root").title = data.root || "";
+    renderWorkspaceFiles();
+  } catch (err) {
+    list.replaceChildren(el("div", { class: "workspace-empty" }, "Could not load project files."));
+  }
+}
+
+function renderWorkspaceFiles() {
+  const list = $("workspace-file-list");
+  list.replaceChildren();
+  if (!state.workspaceFiles.length) {
+    list.append(el("div", { class: "workspace-empty" }, "No files in this project yet."));
+    return;
+  }
+  for (const item of state.workspaceFiles) {
+    if (isHiddenByCollapsedDirectory(item)) continue;
+    const isFile = item.kind === "file";
+    const isCollapsed = state.collapsedWorkspaceDirs.has(item.path);
+    const row = el(
+      "button",
+      {
+        class: `workspace-file-row ${item.kind}${state.selectedFile === item.path ? " active" : ""}`,
+        title: item.path,
+        type: "button",
+        "aria-expanded": isFile ? null : isCollapsed ? "false" : "true",
+      },
+      el("span", { class: "file-indent", style: `width:${Math.min(item.depth || 0, 6) * 14}px` }),
+      el("span", { class: "file-icon" }, isFile ? fileIcon(item.ext) : isCollapsed ? "▸" : "▾"),
+      el("span", { class: "file-name" }, item.name),
+      isFile ? el("span", { class: "file-meta" }, humanBytes(item.size || 0)) : null,
+    );
+    if (isFile) {
+      row.addEventListener("click", () => previewWorkspaceFile(item.path));
+    } else {
+      row.addEventListener("click", () => toggleWorkspaceDirectory(item.path));
+    }
+    list.append(row);
+  }
+}
+
+function toggleWorkspaceDirectory(path) {
+  if (state.collapsedWorkspaceDirs.has(path)) {
+    state.collapsedWorkspaceDirs.delete(path);
+  } else {
+    state.collapsedWorkspaceDirs.add(path);
+  }
+  renderWorkspaceFiles();
+}
+
+function isHiddenByCollapsedDirectory(item) {
+  if (!item.path) return false;
+  for (const dir of state.collapsedWorkspaceDirs) {
+    if (item.path !== dir && item.path.startsWith(`${dir}/`)) return true;
+  }
+  return false;
+}
+
+async function previewWorkspaceFile(path) {
+  state.selectedFile = path;
+  renderWorkspaceFiles();
+  const preview = $("workspace-preview");
+  preview.replaceChildren(el("div", { class: "preview-empty" }, "Loading preview…"));
+  try {
+    const data = await api.previewWorkspaceFile(path);
+    renderWorkspacePreview(data);
+  } catch {
+    preview.replaceChildren(el("div", { class: "preview-message" }, "Could not preview this file."));
+  }
+}
+
+function renderWorkspacePreview(file) {
+  const preview = $("workspace-preview");
+  const openBtn = el("button", { class: "btn-sm preview-open", type: "button" }, "Open");
+  openBtn.addEventListener("click", () => openArtifact(file.path));
+  const head = el(
+    "div",
+    { class: "preview-head" },
+    el("div", { class: "preview-name", title: file.path }, file.name || file.path),
+    el("div", { class: "preview-actions" }, el("div", { class: "preview-size" }, humanBytes(file.size || 0)), openBtn),
+  );
+  let body;
+  if (file.kind === "text") {
+    body = el("pre", { class: "preview-code" }, file.text || "");
+  } else if (file.kind === "image") {
+    body = el("img", { class: "preview-image", src: file.raw_url, alt: file.name || "Preview" });
+  } else if (file.kind === "pdf") {
+    body = el("iframe", { class: "preview-frame", src: file.raw_url, title: file.name || "PDF preview" });
+  } else {
+    body = el("div", { class: "preview-message" }, file.message || "Preview is not available for this file type.");
+  }
+  preview.replaceChildren(head, body);
+}
+
+function fileIcon(ext) {
+  if ([".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"].includes(ext)) return "◇";
+  if (ext === ".pdf") return "□";
+  if ([".csv", ".tsv", ".xlsx", ".xls"].includes(ext)) return "▤";
+  if ([".md", ".txt", ".json", ".py", ".js", ".css", ".html"].includes(ext)) return "≡";
+  return "•";
+}
+
+function humanBytes(bytes) {
+  if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  let size = bytes;
+  let unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit += 1;
+  }
+  return `${size >= 10 || unit === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unit]}`;
 }
 
 // ----------------------------------------------------------------- provider cards (settings modal)
@@ -234,6 +410,7 @@ function buildProviderCard(prov, activeId) {
   const card = el("div", {
     class: "provider-card" + (isActive ? " active" : ""),
     "data-provider-id": prov.id,
+    "data-api-key-set": prov.api_key_set ? "true" : "false",
   });
 
   // Header
@@ -387,6 +564,7 @@ function collectProviders() {
         id: id || name.toLowerCase().replace(/[^a-z0-9]+/g, "-"),
         name,
         api_key: apiKey,
+        api_key_set: !apiKey && card.dataset.apiKeySet === "true",
         base_url: baseUrl,
         models,
         default_model: defaultModel,
@@ -442,6 +620,43 @@ function toggleTheme() {
 }
 
 // ----------------------------------------------------------------- helpers
+function setBootStatus(message) {
+  const bootStatus = $("boot-status");
+  if (bootStatus) bootStatus.textContent = message;
+}
+
+async function finishBoot(message) {
+  const remaining = Math.max(0, minBootMs - (performance.now() - bootStartedAt));
+  if (remaining) {
+    await new Promise((resolve) => setTimeout(resolve, remaining));
+  }
+  await waitForMainStylesheet();
+  setBootStatus(message);
+  await new Promise((resolve) => setTimeout(resolve, 180));
+  const boot = $("boot-screen");
+  if (!boot) return;
+  boot.classList.add("is-done");
+  setTimeout(() => boot.remove(), 650);
+}
+
+function waitForMainStylesheet() {
+  if (document.documentElement.dataset.styles === "ready") return Promise.resolve();
+  const link = $("main-stylesheet");
+  if (!link || link.rel === "stylesheet") return Promise.resolve();
+
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timeout);
+      link.removeEventListener("load", done);
+      link.removeEventListener("error", done);
+      resolve();
+    };
+    const timeout = setTimeout(done, 1200);
+    link.addEventListener("load", done, { once: true });
+    link.addEventListener("error", done, { once: true });
+  });
+}
+
 function hideEmpty() { emptyEl.classList.add("hidden"); }
 function showEmpty() { emptyEl.classList.remove("hidden"); }
 function updateComposer() {
@@ -475,8 +690,11 @@ function wireEvents() {
   $("stop").addEventListener("click", () => state.abort && state.abort.abort());
   $("new-chat").addEventListener("click", newChat);
   $("theme-toggle").addEventListener("click", toggleTheme);
+  $("workspace-toggle").addEventListener("click", toggleWorkspacePanel);
+  $("workspace-refresh").addEventListener("click", refreshWorkspaceFiles);
   $("open-settings").addEventListener("click", openSettings);
   $("save-settings").addEventListener("click", saveSettings);
+  $("choose-workspace").addEventListener("click", chooseWorkspace);
   $("add-provider").addEventListener("click", () => {
     const list = $("providers-list");
     const existing = list.querySelectorAll(".provider-card").length;
